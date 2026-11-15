@@ -23,15 +23,15 @@ All deployment methods provide the same functionality and web interface.
 - **One-Click Execution**: Run scripts directly from the web interface with live output
 - **Real-time Terminal**: Full terminal emulation with xterm.js for interactive script execution
 - **Script Management**: Download, update, and manage local script collections
-- **Security**: Sandboxed script execution with path validation and time limits
-- **Database Integration**: PostgreSQL backend for script metadata and execution history
+- **Script Execution**: Runs scripts with the application's local or remote SSH privileges; this is not a sandbox
+- **Database Integration**: SQLite backend for script metadata and execution history
 - **WebSocket Communication**: Real-time bidirectional communication for script execution
 - 
 
 ## 🏗️ Architecture
 
 ### Frontend
-- **Next.js 15** with React 19
+- **Next.js 16** with React 19
 - **TypeScript** for type safety
 - **Tailwind CSS** for styling
 - **xterm.js** for terminal emulation
@@ -48,15 +48,15 @@ All deployment methods provide the same functionality and web interface.
 - **Installation Scripts**: System setup and configuration tools
 
 ### Database
-- **SQLite Database**: Local database stored at `data/settings.db`
+- **SQLite Database**: Local database selected by `DATABASE_URL` (runtime default: `data/pve-scripts.db`)
 - **Server Management**: Stores Proxmox server configurations and credentials
-- **Automatic Setup**: Database and tables are created automatically on first run
+- **Schema Setup**: Run `npx prisma migrate deploy` before starting a new installation
 - **Data Persistence**: Settings persist across application restarts
 
 ## 📋 Prerequisites
 
 ### For All Deployment Methods
-- **Node.js** 22+ and npm
+- **Node.js** 24+ and npm
 - **Git** for cloning the repository
 - **Proxmox VE environment** (host or access to Proxmox cluster)
 - **SQLite** (included with Node.js better-sqlite3 package)
@@ -105,6 +105,8 @@ cd /opt/PVESciptslocal
 # Install dependencies and build
 npm install
 cp .env.example .env
+# Set DATABASE_URL in .env to the database file for this installation.
+npx prisma migrate deploy
 npm run build
 
 # Create database directory
@@ -204,13 +206,63 @@ npm run build
 
 The application uses SQLite for storing server configurations:
 
-- **Database Location**: `data/settings.db`
-- **Automatic Creation**: Database and tables are created on first run
+- **Database Location**: The file selected by `DATABASE_URL`; runtime defaults to `data/pve-scripts.db`. Older installations may use `data/settings.db`.
+- **Schema Creation**: Run `npx prisma migrate deploy` to create or update database tables
 - **Server Storage**: Proxmox server credentials and configurations
-- **Backup**: Copy `data/settings.db` to backup your server configurations
-- **Reset**: Delete `data/settings.db` to reset all server configurations
+- **Backup**: Stop the service, then back up the configured database, `.env`, and `data/ssh-keys/` together. Keep these backups private because they contain credentials.
+- **Reset**: After backing up, stop the service, remove the configured database, and run `npx prisma migrate deploy` before restarting. This removes saved settings and history.
 
 ## 📖 Feature Guide
+
+### Restore safety
+
+Restores prepare and validate the selected backup before stopping the original
+container. A verified recovery backup of the stopped original is required before
+replacement. If replacement fails with a confirmed remote result, the application
+attempts to recover the original and restore its running state. A successful
+replacement is left stopped for inspection.
+
+Recovery files and a `recovery.json` manifest remain on the Proxmox host under
+`/var/lib/vz/dump/pve-local-restore-<job-id>/`, including after success. The progress
+log reports the exact location. Keep these files until the restored guest has been
+checked; they contain guest data and consume disk space. Cleanup is manual.
+
+This flow supports an existing LXC guest with one storage-backed root disk. Guests
+with additional mounts, unused disks, custom ID maps, snapshots, locks, protection
+or HA management must use Proxmox's restore tools. PBS restoration requires a free
+staging VMID, staging disk space, and PBS credentials matching the username,
+server and datastore configured on the PVE storage. Proxmox handles namespace and
+encryption settings. Staging guests stay stopped with automatic boot disabled;
+the final guest retains the selected backup's boot setting.
+
+On timeout or SSH loss, inspect the host task and the retained recovery manifest
+before retrying. The host lock at `/run/lock/pve-local-restore-<VMID>` is retained
+when completion cannot be confirmed. After confirming no related task remains,
+finish recovery through Proxmox if needed, then remove that empty lock directory.
+Failed staging guests are identified in the progress log and manifest for manual
+inspection and cleanup. No recovery archive is deleted automatically.
+
+### Updating this fork
+
+Application updates are independent from the helper script catalogue. Set these
+values in `.env` and restart the application when changing the release source:
+
+```dotenv
+APP_UPDATE_REPOSITORY="insuusvenerati/ProxmoxVE-Local"
+APP_UPDATE_BRANCH="main"
+```
+
+`APP_UPDATE_REPOSITORY` selects application releases; `APP_UPDATE_BRANCH` selects
+the bootstrap engine source. `REPO_URL` continues to select community helper
+scripts. The same settings apply to `update.sh`, `update-engine.sh`, and the
+prerelease updater. The standalone prerelease script requires `update-source.sh`
+beside it or in `INSTALL_DIR` (default `/opt/ProxmoxVE-Local`).
+
+Publish a release containing the fork-aware updater before using self-update.
+Older engines/releases are refused because they can replace a fork with upstream
+code. In-app updates pass the selected release tag to the local bootstrap; the
+bootstrap is not downloaded from upstream. Direct CLI updates choose stable
+releases by default, or accept an explicit `--version <tag>`.
 
 This section provides detailed information about the application's key features and how to use them effectively.
 
@@ -472,7 +524,7 @@ PVESciptslocal/
 │       ├── database.js       # SQLite database service
 │       └── services/         # Business logic services
 ├── data/                     # Database storage
-│   └── settings.db           # SQLite database file
+│   └── pve-scripts.db        # Default SQLite database (or DATABASE_URL)
 ├── public/                   # Static assets
 ├── server.js                 # Main server file
 └── package.json              # Dependencies and scripts
@@ -482,7 +534,7 @@ PVESciptslocal/
 ## 🚀 Development
 
 ### Prerequisites for Development
-- Node.js 22+
+- Node.js 24+
 - Git
 
 ### Development Commands
