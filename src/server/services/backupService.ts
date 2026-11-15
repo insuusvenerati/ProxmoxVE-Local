@@ -4,6 +4,16 @@ import { getDatabase } from '../database-prisma';
 import type { Server } from '~/types/server';
 import type { Storage } from './storageService';
 import { getStorageDumpPath, quoteShellArgument } from './backupPath';
+import { getPBSConnection } from './pbsConnection';
+import { runRemoteCommand } from './remoteCommand';
+import { parseLXCSnapshot, vmidSchema } from '../lib/proxmoxValidation';
+import { z } from 'zod';
+
+const pbsSnapshotListSchema = z.array(z.object({
+  'backup-id': z.string(), 'backup-type': z.literal('ct'),
+  'backup-time': z.number().int().nonnegative().max(253402300799),
+  size: z.number().int().nonnegative().safe().optional(),
+}));
 
 export interface BackupData {
   container_id: string;
@@ -52,6 +62,7 @@ class BackupService {
    * Discover local backups in /var/lib/vz/dump/
    */
   async discoverLocalBackups(server: Server, ctId: string, hostname: string): Promise<BackupData[]> {
+    vmidSchema.parse(ctId);
     const sshService = getSSHExecutionService();
     const backups: BackupData[] = [];
     
@@ -94,7 +105,7 @@ class BackupService {
         
         try {
           // Get file size and modification time
-          const statCommand = `stat -c "%s|%Y|%n" "${backupPath}" 2>/dev/null || stat -f "%z|%m|%N" "${backupPath}" 2>/dev/null || echo ""`;
+          const statCommand = `stat -c '%s|%Y|%n' -- ${quoteShellArgument(backupPath)} 2>/dev/null || echo ""`;
           let statOutput = '';
           
           await Promise.race([
@@ -174,6 +185,7 @@ class BackupService {
    * Discover backups in a mounted storage's configured dump directory.
    */
   async discoverStorageBackups(server: Server, storage: Storage, ctId: string, hostname: string): Promise<BackupData[]> {
+    vmidSchema.parse(ctId);
     const sshService = getSSHExecutionService();
     const backups: BackupData[] = [];
     
@@ -218,7 +230,7 @@ class BackupService {
         if (!backupPath.trim()) continue;
         
         try {
-          const statCommand = `stat -c "%s|%Y|%n" "${backupPath}" 2>/dev/null || stat -f "%z|%m|%N" "${backupPath}" 2>/dev/null || echo ""`;
+          const statCommand = `stat -c '%s|%Y|%n' -- ${quoteShellArgument(backupPath)} 2>/dev/null || echo ""`;
           let statOutput = '';
           
           await Promise.race([
@@ -302,267 +314,39 @@ class BackupService {
    * Login to PBS using stored credentials
    */
   async loginToPBS(server: Server, storage: Storage): Promise<boolean> {
-    const db = getDatabase();
-    const credential = await db.getPBSCredential(server.id, storage.name);
-    
-    if (!credential) {
-      console.log(`[BackupService] No PBS credentials found for storage ${storage.name}, skipping PBS discovery`);
-      return false;
-    }
-    
-    const sshService = getSSHExecutionService();
-    const storageService = getStorageService();
-    const pbsInfo = storageService.getPBSStorageInfo(storage);
-    
-    // Use IP and datastore from credentials (they override config if different)
-    const pbsIp = credential.pbs_ip ?? pbsInfo.pbs_ip;
-    const pbsDatastore = credential.pbs_datastore ?? pbsInfo.pbs_datastore;
-    
-    if (!pbsIp || !pbsDatastore) {
-      console.log(`[BackupService] Missing PBS IP or datastore for storage ${storage.name}`);
-      return false;
-    }
-    
-    // Build login command
-    // Format: proxmox-backup-client login --repository <user>@<IP>:<DATASTORE>
-    // PBS supports PBS_PASSWORD and PBS_REPOSITORY environment variables for non-interactive login
-    const pbsUsername = credential.pbs_username ?? 'root@pam';
-    const repository = `${pbsUsername}@${pbsIp}:${pbsDatastore}`;
-    
-    // Escape password and fingerprint for shell safety (single quotes)
-    const escapedPassword = credential.pbs_password.replace(/'/g, "'\\''");
-    const fingerprint = credential.pbs_fingerprint?.trim() ?? '';
-    const escapedFingerprint = fingerprint ? fingerprint.replace(/'/g, "'\\''") : '';
-    const envParts = [`PBS_PASSWORD='${escapedPassword}'`, `PBS_REPOSITORY='${repository}'`];
-    if (escapedFingerprint) {
-      envParts.push(`PBS_FINGERPRINT='${escapedFingerprint}'`);
-    }
-    const envStr = envParts.join(' ');
-    const fullCommand = `${envStr} timeout 10 proxmox-backup-client login --repository ${repository} 2>&1`;
-    
-    console.log(`[BackupService] Logging into PBS: ${repository}`);
-    
-    let loginOutput = '';
-    let loginSuccess = false;
-    
     try {
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          void sshService.executeCommand(
-            server,
-            fullCommand,
-            (data: string) => {
-              loginOutput += data;
-            },
-            (error: string) => {
-              console.log(`[BackupService] PBS login error: ${error}`);
-              resolve();
-            },
-            (exitCode: number) => {
-              loginSuccess = exitCode === 0;
-              if (loginSuccess) {
-                console.log(`[BackupService] Successfully logged into PBS: ${repository}`);
-              } else {
-                console.log(`[BackupService] PBS login failed with exit code ${exitCode}`);
-                console.log(`[BackupService] Login output: ${loginOutput}`);
-              }
-              resolve();
-            }
-          );
-        }),
-        new Promise<void>((resolve) => {
-          setTimeout(() => {
-            console.log(`[BackupService] PBS login timeout`);
-            resolve();
-          }, 15000); // 15 second timeout
-        })
-      ]);
-      
-      // Check if login was successful (look for success indicators in output)
-      if (loginSuccess || loginOutput.includes('successfully') || loginOutput.includes('logged in')) {
-        return true;
-      }
-      
-      return false;
-    } catch (error) {
-      console.error(`[BackupService] Error during PBS login:`, error);
-      return false;
-    }
+      const credential = await getDatabase().getPBSCredential(server.id, storage.name);
+      if (!credential) return false;
+      const connection = getPBSConnection(credential, storage);
+      // status works with both user passwords and API tokens; login does not.
+      await runRemoteCommand(server, `${connection.environment} proxmox-backup-client status --repository ${quoteShellArgument(connection.repository)}`, 'Check PBS access', 30);
+      return true;
+    } catch { return false; }
   }
 
-  /**
-   * Discover PBS backups using proxmox-backup-client
-   */
   async discoverPBSBackups(server: Server, storage: Storage, ctId: string, hostname: string): Promise<BackupData[]> {
-    const sshService = getSSHExecutionService();
-    const backups: BackupData[] = [];
-    
-    // Login to PBS first
-    const loggedIn = await this.loginToPBS(server, storage);
-    if (!loggedIn) {
-      console.log(`[BackupService] Failed to login to PBS for storage ${storage.name}, skipping backup discovery`);
-      return backups;
-    }
-    
-    // Get PBS credentials to build full repository string
-    const db = getDatabase();
-    const credential = await db.getPBSCredential(server.id, storage.name);
-    if (!credential) {
-      console.log(`[BackupService] No PBS credentials found for storage ${storage.name}`);
-      return backups;
-    }
-    
-    const storageService = getStorageService();
-    const pbsInfo = storageService.getPBSStorageInfo(storage);
-    const pbsIp = credential.pbs_ip ?? pbsInfo.pbs_ip;
-    const pbsDatastore = credential.pbs_datastore ?? pbsInfo.pbs_datastore;
-    
-    if (!pbsIp || !pbsDatastore) {
-      console.log(`[BackupService] Missing PBS IP or datastore for storage ${storage.name}`);
-      return backups;
-    }
-    
-    // Build full repository string: root@pam@<IP>:<DATASTORE>
-    const repository = `root@pam@${pbsIp}:${pbsDatastore}`;
-    const fingerprint = credential.pbs_fingerprint?.trim() ?? '';
-    const escapedFingerprint = fingerprint ? fingerprint.replace(/'/g, "'\\''") : '';
-    const snapshotEnvParts = escapedFingerprint ? [`PBS_FINGERPRINT='${escapedFingerprint}'`] : [];
-    const snapshotEnvStr = snapshotEnvParts.length ? snapshotEnvParts.join(' ') + ' ' : '';
-    // Include --ns flag if the storage has a namespace configured
-    const pbsNamespace = (storage as any).namespace ? `--ns ${(storage as any).namespace}` : '';
-    // Use correct command: snapshot list ct/<CT_ID> --repository <full_repo_string>
-    const command = `${snapshotEnvStr}timeout 30 proxmox-backup-client snapshot list ct/${ctId} --repository ${repository} ${pbsNamespace} 2>&1 || echo "PBS_ERROR"`;
-    let output = '';
-    
-    console.log(`[BackupService] Discovering PBS backups for CT ${ctId} on repository ${repository}`);
-    
-    try {
-      // Add timeout to prevent hanging
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          void sshService.executeCommand(
-            server,
-            command,
-            (data: string) => {
-              output += data;
-            },
-            (error: string) => {
-              console.log(`[BackupService] PBS command error: ${error}`);
-              resolve();
-            },
-            (exitCode: number) => {
-              console.log(`[BackupService] PBS command completed with exit code ${exitCode}`);
-              resolve();
-            }
-          );
-        }),
-        new Promise<void>((resolve) => {
-          setTimeout(() => {
-            console.log(`[BackupService] PBS discovery timeout, continuing...`);
-            resolve();
-          }, 35000); // 35 second timeout (command has 30s timeout, so this is a safety net)
-        })
-      ]);
-      
-      // Check if PBS command failed
-      if (output.includes('PBS_ERROR') || output.includes('error') || output.includes('Error')) {
-        console.log(`[BackupService] PBS discovery failed or no backups found for CT ${ctId}`);
-        return backups;
-      }
-      
-      // Parse PBS snapshot list output (table format)
-      // Format: snapshot | size | files
-      // Example: ct/148/2025-10-21T19:14:55Z | 994.944 MiB | catalog.pcat1 client.log ...
-      const lines = output.trim().split('\n').filter(line => line.trim());
-      
-      console.log(`[BackupService] Parsing ${lines.length} lines from PBS output`);
-      
-      for (const line of lines) {
-        // Skip header lines, separators, or error messages
-        if (line.includes('snapshot') && line.includes('size') && line.includes('files')) {
-          continue; // Skip header row
-        }
-        if (line.includes('═') || line.includes('─') || line.includes('│') && (/^[│═─╞╪╡├┼┤└┴┘]+$/.exec(line))) {
-          continue; // Skip table separator lines
-        }
-        if (line.includes('repository') || line.includes('error') || line.includes('Error') || line.includes('PBS_ERROR')) {
-          continue;
-        }
-        
-        // Parse table row - format: snapshot | size | files
-        // Example: │ ct/148/2025-10-21T19:14:55Z │ 994.944 MiB │ catalog.pcat1 client.log index.json pct.conf root.pxar │
-        const parts = line.split('│').map(p => p.trim()).filter(p => p);
-        
-        if (parts.length >= 2) {
-          const snapshotPath = parts[0]; // e.g., "ct/148/2025-10-21T19:14:55Z"
-          const sizeStr = parts[1]; // e.g., "994.944 MiB"
-          
-          if (!snapshotPath) {
-            continue; // Skip if no snapshot path
-          }
-          
-          // Extract snapshot name (last part after /)
-          const snapshotParts = snapshotPath.split('/');
-          const snapshotName = snapshotParts[snapshotParts.length - 1] ?? snapshotPath;
-          
-          if (!snapshotName) {
-            continue; // Skip if no snapshot name
-          }
-          
-          // Parse date from snapshot name (format: 2025-10-21T19:14:55Z)
-          let createdAt: Date | undefined;
-          const dateMatch = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)/.exec(snapshotName);
-          if (dateMatch?.[1]) {
-            try {
-              createdAt = new Date(dateMatch[1]);
-            } catch (e) {
-              console.error('Error parsing date:', e);
-              // Invalid date, leave undefined
-            }
-          }
-          
-          // Parse size (convert MiB/GiB to bytes)
-          let size: bigint | undefined;
-          if (sizeStr) {
-            const sizeMatch = /([\d.]+)\s*(MiB|GiB|KiB|B)/i.exec(sizeStr);
-            if (sizeMatch?.[1] && sizeMatch[2]) {
-              const sizeValue = parseFloat(sizeMatch[1]);
-              const unit = sizeMatch[2].toUpperCase();
-              let bytes = sizeValue;
-              
-              if (unit === 'KIB') bytes = sizeValue * 1024;
-              else if (unit === 'MIB') bytes = sizeValue * 1024 * 1024;
-              else if (unit === 'GIB') bytes = sizeValue * 1024 * 1024 * 1024;
-              
-              size = BigInt(Math.floor(bytes));
-            }
-          }
-          
-          backups.push({
-            container_id: ctId,
-            server_id: server.id,
-            hostname,
-            backup_name: snapshotName,
-            backup_path: `pbs://${repository}/${snapshotPath}`,
-            size,
-            created_at: createdAt,
-            storage_name: storage.name,
-            storage_type: 'pbs',
-          });
-        }
-      }
-      
-      console.log(`[BackupService] Found ${backups.length} PBS backups for CT ${ctId}`);
-    } catch (error) {
-      console.error(`Error discovering PBS backups for CT ${ctId}:`, error);
-    }
-    
-    return backups;
+    vmidSchema.parse(ctId);
+    const credential = await getDatabase().getPBSCredential(server.id, storage.name);
+    if (!credential) return [];
+    const connection = getPBSConnection(credential, storage);
+    const command = `${connection.environment} proxmox-backup-client snapshot list ${quoteShellArgument(`ct/${ctId}`)} --repository ${quoteShellArgument(connection.repository)}${connection.namespaceArgument} --output-format json`;
+    const output = await runRemoteCommand(server, command, 'List PBS snapshots', 60);
+    const snapshots = pbsSnapshotListSchema.parse(JSON.parse(output));
+    return snapshots.map(snapshot => {
+      if (snapshot['backup-id'] !== ctId || snapshot['backup-type'] !== 'ct') throw new Error('PBS returned a snapshot for another container');
+      const date = new Date(snapshot['backup-time'] * 1000);
+      const snapshotPath = parseLXCSnapshot(`ct/${ctId}/${date.toISOString().replace('.000Z', 'Z')}`, ctId);
+      return {
+        container_id: ctId, server_id: server.id, hostname,
+        backup_name: date.toISOString().replace('.000Z', 'Z'),
+        backup_path: `pbs://${connection.repository}/${snapshotPath}`,
+        size: snapshot.size === undefined ? undefined : BigInt(snapshot.size),
+        created_at: date, storage_name: storage.name, storage_type: 'pbs',
+      };
+    });
   }
 
-  /**
-   * Discover all backups for a container across all backup-capable storages
-   */
+  /** Discover across supported storages. */
   async discoverAllBackupsForContainer(server: Server, ctId: string, hostname: string): Promise<BackupData[]> {
     const allBackups: BackupData[] = [];
     

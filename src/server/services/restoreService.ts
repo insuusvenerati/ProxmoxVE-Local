@@ -1,570 +1,189 @@
-/* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/prefer-optional-chain, @typescript-eslint/prefer-nullish-coalescing, @typescript-eslint/prefer-regexp-exec, @typescript-eslint/no-empty-function */
-import { getSSHExecutionService } from '../ssh-execution-service';
-import { getBackupService } from './backupService';
-import { getStorageService } from './storageService';
+import { randomUUID } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { getDatabase } from '../database-prisma';
+import { databaseIdSchema, parseLXCSnapshot, storageIdSchema, vmidSchema } from '../lib/proxmoxValidation';
+import { getStorageService } from './storageService';
+import { quoteShellArgument as q } from './backupPath';
+import { assertNativePBSStorage, getPBSConnection } from './pbsConnection';
+import { RemoteCommandError, runRemoteCommand } from './remoteCommand';
 import type { Server } from '~/types/server';
-import type { Storage } from './storageService';
-import { writeFile } from 'fs/promises';
-import { join } from 'path';
 
-export interface RestoreProgress {
-  step: string;
-  message: string;
-}
-
+export interface RestoreProgress { step: string; message: string }
 export interface RestoreResult {
   success: boolean;
   error?: string;
-  progress?: RestoreProgress[];
+  progress: RestoreProgress[];
+  recoveryPath?: string;
 }
 
-class RestoreService {
-  /**
-   * Get rootfs storage from LXC config or installed scripts database
-   */
-  async getRootfsStorage(server: Server, ctId: string): Promise<string | null> {
-    const sshService = getSSHExecutionService();
-    const db = getDatabase();
-    const configPath = `/etc/pve/lxc/${ctId}.conf`;
-    const readCommand = `cat "${configPath}" 2>/dev/null || echo ""`;
-    let rawConfig = '';
-    
-    try {
-      // Try to read config file (container might not exist, so don't fail on error)
-      await new Promise<void>((resolve) => {
-        sshService.executeCommand(
-          server,
-          readCommand,
-          (data: string) => {
-            rawConfig += data;
-          },
-          () => resolve(), // Don't fail on error
-          () => resolve() // Always resolve
-        );
-      });
-      
-      // If we got config content, parse it
-      if (rawConfig.trim()) {
-        // Parse rootfs line: rootfs: PROX2-STORAGE2:vm-148-disk-0,size=4G
-        const lines = rawConfig.split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('rootfs:')) {
-            const match = trimmed.match(/^rootfs:\s*([^:]+):/);
-            if (match && match[1]) {
-              return match[1].trim();
-            }
-          }
-        }
-      }
-      
-      // If config file doesn't exist or doesn't have rootfs, try to get from installed scripts database
-      const installedScripts = await db.getAllInstalledScripts();
-      const script = installedScripts.find((s: any) => s.container_id === ctId && s.server_id === server.id);
-      
-      if (script) {
-        // Try to get LXC config from database
-        const lxcConfig = await db.getLXCConfigByScriptId(script.id);
-        if (lxcConfig?.rootfs_storage) {
-          // Extract storage from rootfs_storage format: "STORAGE:vm-148-disk-0"
-          const match = lxcConfig.rootfs_storage.match(/^([^:]+):/);
-          if (match && match[1]) {
-            return match[1].trim();
-          }
-        }
-      }
-      
-      return null;
-      } catch {
-        // Try fallback to database
-        try {
-          const installedScripts = await db.getAllInstalledScripts();
-          const script = installedScripts.find((s: any) => s.container_id === ctId && s.server_id === server.id);
-          if (script) {
-            const lxcConfig = await db.getLXCConfigByScriptId(script.id);
-            if (lxcConfig?.rootfs_storage) {
-              const match = lxcConfig.rootfs_storage.match(/^([^:]+):/);
-              if (match && match[1]) {
-                return match[1].trim();
-              }
-            }
-          }
-        } catch {
-          // Ignore database error
-        }
-        return null;
-      }
+/** Restrict replacement to layouts one vzdump archive can recover. */
+export function validateRestoreConfig(config: string): string {
+  if (/^(?:mp\d+|unused\d+|dev\d+|lxc\.mount\.entry|lxc\.idmap|lock):/m.test(config) || /^\[/m.test(config) || /^protection:\s*1\s*$/m.test(config)) {
+    throw new Error('Restore requires a single root disk without extra mounts, unused disks, custom ID maps, snapshots or locks; use Proxmox for this guest');
   }
+  const rootfs = /^rootfs:\s*([A-Za-z][A-Za-z0-9_.-]*):[^\s,]+/m.exec(config);
+  if (!rootfs?.[1]) throw new Error('A storage-backed LXC root disk is required');
+  return storageIdSchema.parse(rootfs[1]);
+}
 
-  /**
-   * Stop container (continue if already stopped)
-   */
-  async stopContainer(server: Server, ctId: string): Promise<void> {
-    const sshService = getSSHExecutionService();
-    const command = `pct stop ${ctId} 2>&1 || true`; // Continue even if already stopped
-    
-    await new Promise<void>((resolve) => {
-      sshService.executeCommand(
-        server,
-        command,
-        () => {},
-        () => resolve(),
-        () => resolve() // Always resolve, don't fail if already stopped
-      );
-    });
-  }
+// The application shares one progress log, so serialize restores across instances.
+let restoreActive = false;
 
-  /**
-   * Destroy container
-   */
-  async destroyContainer(server: Server, ctId: string): Promise<void> {
-    const sshService = getSSHExecutionService();
-    const command = `pct destroy ${ctId} 2>&1`;
-    let output = '';
-    let exitCode = 0;
-    
-    await new Promise<void>((resolve, reject) => {
-      sshService.executeCommand(
-        server,
-        command,
-        (data: string) => {
-          output += data;
-        },
-        (error: string) => {
-          // Check if error is about container not existing
-          if (error.includes('does not exist') || error.includes('not found')) {
-            resolve(); // Container doesn't exist, that's fine
-          } else {
-            reject(new Error(`Destroy failed: ${error}`));
-          }
-        },
-        (code: number) => {
-          exitCode = code;
-          if (exitCode === 0) {
-            resolve();
-          } else {
-            // Check if error is about container not existing
-            if (output.includes('does not exist') || output.includes('not found') || output.includes('No such file')) {
-              resolve(); // Container doesn't exist, that's fine
-            } else {
-              reject(new Error(`Destroy failed with exit code ${exitCode}: ${output}`));
-            }
-          }
-        }
-      );
-    });
-  }
-
-  /**
-   * Restore from local/storage backup
-   */
-  async restoreLocalBackup(
-    server: Server,
-    ctId: string,
-    backupPath: string,
-    storage: string
-  ): Promise<void> {
-    const sshService = getSSHExecutionService();
-    const command = `pct restore ${ctId} "${backupPath}" --storage=${storage}`;
-    let output = '';
-    let exitCode = 0;
-    
-    await new Promise<void>((resolve, reject) => {
-      sshService.executeCommand(
-        server,
-        command,
-        (data: string) => {
-          output += data;
-        },
-        (error: string) => {
-          reject(new Error(`Restore failed: ${error}`));
-        },
-        (code: number) => {
-          exitCode = code;
-          if (exitCode === 0) {
-            resolve();
-          } else {
-            reject(new Error(`Restore failed with exit code ${exitCode}: ${output}`));
-          }
-        }
-      );
-    });
-  }
-
-  /**
-   * Restore from PBS backup
-   */
-  async restorePBSBackup(
-    server: Server,
-    storage: Storage,
-    ctId: string,
-    snapshotPath: string,
-    storageName: string,
-    onProgress?: (step: string, message: string) => Promise<void>
-  ): Promise<void> {
-    const backupService = getBackupService();
-    const sshService = getSSHExecutionService();
-    const db = getDatabase();
-    
-    // Get PBS credentials
-    const credential = await db.getPBSCredential(server.id, storage.name);
-    if (!credential) {
-      throw new Error(`No PBS credentials found for storage ${storage.name}`);
-    }
-    
-    const storageService = getStorageService();
-    const pbsInfo = storageService.getPBSStorageInfo(storage);
-    const pbsIp = credential.pbs_ip || pbsInfo.pbs_ip;
-    const pbsDatastore = credential.pbs_datastore || pbsInfo.pbs_datastore;
-    
-    if (!pbsIp || !pbsDatastore) {
-      throw new Error(`Missing PBS IP or datastore for storage ${storage.name}`);
-    }
-    
-    const repository = `root@pam@${pbsIp}:${pbsDatastore}`;
-    
-    // Extract snapshot name from path (e.g., "2025-10-21T19:14:55Z" from "ct/148/2025-10-21T19:14:55Z")
-    const snapshotParts = snapshotPath.split('/');
-    const snapshotName = snapshotParts[snapshotParts.length - 1] || snapshotPath;
-    // Replace colons with underscores for file paths (tar doesn't like colons in filenames)
-    const snapshotNameForPath = snapshotName.replace(/:/g, '_');
-    
-    // Determine file extension - try common extensions
-    let downloadedPath = '';
-    let downloadSuccess = false;
-    
-    // Login to PBS first
-    if (onProgress) await onProgress('pbs_login', 'Logging into PBS...');
-    const loggedIn = await backupService.loginToPBS(server, storage);
-    if (!loggedIn) {
-      throw new Error(`Failed to login to PBS for storage ${storage.name}`);
-    }
-    
-    // Download backup from PBS
-    // proxmox-backup-client restore outputs a folder, not a file
-    if (onProgress) await onProgress('pbs_download', 'Downloading backup from PBS...');
-    
-    // Target folder for PBS restore (without extension)
-    // Use sanitized snapshot name (colons replaced with underscores) for file paths
-    const targetFolder = `/var/lib/vz/dump/vzdump-lxc-${ctId}-${snapshotNameForPath}`;
-    const targetTar = `${targetFolder}.tar`;
-    
-    // Use PBS_PASSWORD env var and add timeout for long downloads; PBS_FINGERPRINT when set for cert validation
-    const escapedPassword = credential.pbs_password.replace(/'/g, "'\\''");
-    const fingerprint = credential.pbs_fingerprint?.trim() ?? '';
-    const escapedFingerprint = fingerprint ? fingerprint.replace(/'/g, "'\\''") : '';
-    const restoreEnvParts = [`PBS_PASSWORD='${escapedPassword}'`, `PBS_REPOSITORY='${repository}'`];
-    if (escapedFingerprint) {
-      restoreEnvParts.push(`PBS_FINGERPRINT='${escapedFingerprint}'`);
-    }
-    const restoreEnvStr = restoreEnvParts.join(' ');
-    const restoreCommand = `${restoreEnvStr} timeout 300 proxmox-backup-client restore "${snapshotPath}" root.pxar "${targetFolder}" --repository '${repository}' 2>&1`;
-    
-    let output = '';
-    let exitCode = 0;
-    
-    try {
-      // Download from PBS (creates a folder)
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
-          sshService.executeCommand(
-            server,
-            restoreCommand,
-            (data: string) => {
-              output += data;
-            },
-            (error: string) => {
-              reject(new Error(`Download failed: ${error}`));
-            },
-            (code: number) => {
-              exitCode = code;
-              if (exitCode === 0) {
-                resolve();
-              } else {
-                reject(new Error(`Download failed with exit code ${exitCode}: ${output}`));
-              }
-            }
-          );
-        }),
-        new Promise<void>((resolve, reject) => {
-          setTimeout(() => {
-            reject(new Error('Download timeout after 5 minutes'));
-          }, 300000); // 5 minute timeout
-        })
-      ]);
-      
-      // Check if folder exists
-      const checkCommand = `test -d "${targetFolder}" && echo "exists" || echo "notfound"`;
-      let checkOutput = '';
-      
-      await new Promise<void>((resolve) => {
-        sshService.executeCommand(
-          server,
-          checkCommand,
-          (data: string) => {
-            checkOutput += data;
-          },
-          () => resolve(),
-          () => resolve()
-        );
-      });
-      
-      if (!checkOutput.includes('exists')) {
-        throw new Error(`Downloaded folder ${targetFolder} does not exist`);
-      }
-      
-      // Pack the folder into a tar file
-      if (onProgress) await onProgress('pbs_pack', 'Packing backup folder...');
-      
-      // Use -C to change to the folder directory, then pack all contents (.) into the tar file
-      const packCommand = `tar -cf "${targetTar}" -C "${targetFolder}" . 2>&1`;
-      let packOutput = '';
-      let packExitCode = 0;
-      
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
-          sshService.executeCommand(
-            server,
-            packCommand,
-            (data: string) => {
-              packOutput += data;
-            },
-            (error: string) => {
-              reject(new Error(`Pack failed: ${error}`));
-            },
-            (code: number) => {
-              packExitCode = code;
-              if (packExitCode === 0) {
-                resolve();
-              } else {
-                reject(new Error(`Pack failed with exit code ${packExitCode}: ${packOutput}`));
-              }
-            }
-          );
-        }),
-        new Promise<void>((resolve, reject) => {
-          setTimeout(() => {
-            reject(new Error('Pack timeout after 2 minutes'));
-          }, 120000); // 2 minute timeout for packing
-        })
-      ]);
-      
-      // Check if tar file exists
-      const checkTarCommand = `test -f "${targetTar}" && echo "exists" || echo "notfound"`;
-      let checkTarOutput = '';
-      
-      await new Promise<void>((resolve) => {
-        sshService.executeCommand(
-          server,
-          checkTarCommand,
-          (data: string) => {
-            checkTarOutput += data;
-          },
-          () => resolve(),
-          () => resolve()
-        );
-      });
-      
-      if (!checkTarOutput.includes('exists')) {
-        throw new Error(`Packed tar file ${targetTar} does not exist`);
-      }
-      
-      downloadedPath = targetTar;
-      downloadSuccess = true;
-    } catch (error) {
-      throw error;
-    }
-    
-    if (!downloadSuccess || !downloadedPath) {
-      throw new Error(`Failed to download and pack backup from PBS`);
-    }
-    
-    // Restore from packed tar file
-      if (onProgress) await onProgress('restoring', 'Restoring container...');
-    try {
-      await this.restoreLocalBackup(server, ctId, downloadedPath, storageName);
-    } finally {
-      // Cleanup: delete downloaded folder and tar file
-      if (onProgress) await onProgress('cleanup', 'Cleaning up temporary files...');
-      const cleanupCommand = `rm -rf "${targetFolder}" "${targetTar}" 2>&1 || true`;
-      sshService.executeCommand(
-        server,
-        cleanupCommand,
-        () => {},
-        () => {},
-        () => {}
-      );
-    }
-  }
-
-  /**
-   * Execute full restore flow
-   */
-  async executeRestore(
-    backupId: number,
-    containerId: string,
-    serverId: number,
-    onProgress?: (progress: RestoreProgress) => void
-  ): Promise<RestoreResult> {
+export class RestoreService {
+  async executeRestore(backupId: number, containerId: string, serverId: number, onProgress?: (progress: RestoreProgress) => void): Promise<RestoreResult> {
     const progress: RestoreProgress[] = [];
+    if (restoreActive) return { success: false, error: 'Another restore is already in progress', progress };
+    restoreActive = true;
     const logPath = join(process.cwd(), 'restore.log');
-    
-    // Clear log file at start of restore
-    const clearLogFile = async () => {
-      try {
-        await writeFile(logPath, '', 'utf-8');
-      } catch {
-        // Ignore log file errors
-      }
+    const log = async (step: string, message: string) => {
+      const item = { step, message };
+      progress.push(item);
+      await writeFile(logPath, `${message}\n`, { flag: 'a' }).catch(() => undefined);
+      try { onProgress?.(item); } catch { /* presentation cannot abort recovery */ }
     };
-    
-    // Write progress to log file
-    const writeProgressToLog = async (message: string) => {
-      try {
-        const logLine = `${message}\n`;
-        await writeFile(logPath, logLine, { flag: 'a', encoding: 'utf-8' });
-      } catch {
-        // Ignore log file errors
-      }
+    let server: Server | undefined;
+    let recoveryPath: string | undefined;
+    let job: string | undefined;
+    let sourcePath: string | undefined;
+    let stagingContainerId: string | undefined;
+    let storage: string | undefined;
+    let remoteLocked = false;
+    let uncertain = false;
+    let stopped = false;
+    let wasRunning = false;
+    let replacementStarted = false;
+    let recovered = false;
+    const lock = `/run/lock/pve-local-restore-${containerId}`;
+    const record = async (phase: string) => {
+      if (!server || !job) return;
+      const manifest = JSON.stringify({ backupId, serverId, containerId, storage, wasRunning, recoveryPath, sourcePath, stagingContainerId, phase });
+      await runRemoteCommand(server, `printf '%s\n' ${q(manifest)} > ${q(`${job}/recovery.json`)} && sync -f ${q(`${job}/recovery.json`)}`, 'Save recovery manifest', 30);
     };
-    
-    const addProgress = async (step: string, message: string) => {
-      const p = { step, message };
-      progress.push(p);
-      
-      // Write to log file (just the message, without step prefix)
-      await writeProgressToLog(message);
-      
-      // Call callback if provided
-      if (onProgress) {
-        onProgress(p);
-      }
+    const verifyArchive = async (path: string) => {
+      await runRemoteCommand(server!, `test -f ${q(path)} && test -s ${q(path)} && tar -tf ${q(path)} > /dev/null`, 'Verify complete backup archive');
+      validateRestoreConfig(await runRemoteCommand(server!, `pvesm extractconfig ${q(path)}`, 'Read backup configuration', 60));
     };
-    
     try {
-      // Clear log file at start
-      await clearLogFile();
-      
+      vmidSchema.parse(containerId);
+      databaseIdSchema.parse(serverId);
+      databaseIdSchema.parse(backupId);
+      await writeFile(logPath, '').catch(() => undefined);
       const db = getDatabase();
-      const sshService = getSSHExecutionService();
-      
-      await addProgress('starting', 'Starting restore...');
-      
-      // Get backup details
       const backup = await db.getBackupById(backupId);
-      if (!backup) {
-        throw new Error(`Backup with ID ${backupId} not found`);
-      }
-      
-      // Get server details
-      const serverData = await db.getServerById(serverId);
-      if (!serverData) {
-        throw new Error(`Server with ID ${serverId} not found`);
-      }
-      // Cast to Server type (Prisma returns nullable fields as null, Server uses undefined)
-      const server = serverData as unknown as Server;
-      
-      // Get rootfs storage
-      await addProgress('reading_config', 'Reading container configuration...');
-      const rootfsStorage = await this.getRootfsStorage(server, containerId);
-      
-      if (!rootfsStorage) {
-        // Try to check if container exists, if not we can proceed without stopping/destroying
-        const checkCommand = `pct list ${containerId} 2>&1 | grep -q "^${containerId}" && echo "exists" || echo "notfound"`;
-        let checkOutput = '';
-        await new Promise<void>((resolve) => {
-          sshService.executeCommand(
-            server,
-            checkCommand,
-            (data: string) => {
-              checkOutput += data;
-            },
-            () => resolve(),
-            () => resolve()
-          );
-        });
-        
-        if (checkOutput.includes('notfound')) {
-          // Container doesn't exist, we can't determine storage - need user input or use default
-          throw new Error(`Container ${containerId} does not exist and storage could not be determined. Please ensure the container exists or specify the storage manually.`);
-        }
-        
-        throw new Error(`Could not determine rootfs storage for container ${containerId}. Please ensure the container exists and has a valid configuration.`);
-      }
-      
-      // Try to stop and destroy container - if it doesn't exist, continue anyway
-      await addProgress('stopping', 'Stopping container...');
-      try {
-        await this.stopContainer(server, containerId);
-      } catch {
-        // Continue even if stop fails
-      }
-      
-      // Try to destroy container - if it doesn't exist, continue anyway
-      await addProgress('destroying', 'Destroying container...');
-      try {
-        await this.destroyContainer(server, containerId);
-      } catch {
-        // Container might not exist, which is fine - continue with restore
-        await addProgress('skipping', 'Container does not exist or already destroyed, continuing...');
-      }
-      
-      // Restore based on backup type
+      if (backup?.server_id !== serverId || backup.container_id !== containerId) throw new Error('Backup does not belong to this server and container');
+      const savedServer = await db.getServerById(serverId);
+      if (!savedServer) throw new Error('Server not found');
+      server = savedServer as unknown as Server;
+      await runRemoteCommand(server, `mkdir ${q(lock)}`, 'Acquire restore lock', 30);
+      remoteLocked = true;
+      // Raw config includes snapshot sections which pct config omits.
+      const originalConfig = await runRemoteCommand(server, `cat ${q(`/etc/pve/lxc/${containerId}.conf`)}`, 'Read original LXC configuration', 30);
+      storage = validateRestoreConfig(originalConfig);
+      const ha = await runRemoteCommand(server, 'if test -e /etc/pve/ha/resources.cfg; then cat /etc/pve/ha/resources.cfg; fi', 'Check HA resources', 30);
+      if (new RegExp(`^ct:\\s*${containerId}(?:\\s|$)`, 'm').test(ha)) throw new Error('HA-managed containers must be restored through Proxmox');
+      const status = (await runRemoteCommand(server, `pct status ${containerId}`, 'Read container status', 30)).trim();
+      if (!/^status: (running|stopped)$/.test(status)) throw new Error('Unable to determine original container state');
+      wasRunning = status === 'status: running';
+      job = `/var/lib/vz/dump/pve-local-restore-${randomUUID()}`;
+      await runRemoteCommand(server, `umask 077; mkdir ${q(job)} && mkdir ${q(`${job}/source`)} ${q(`${job}/original`)}`, 'Create recovery directory', 30);
+      await log('preparing', `Preparing backup. Recovery files will be retained at ${job}`);
+      await record('preparing');
+      let source: string;
+      let sourceOnboot: number | undefined;
       if (backup.storage_type === 'pbs') {
-        // Get storage info for PBS
-        const storageService = getStorageService();
-        const storages = await storageService.getStorages(server, false);
-        const storage = storages.find(s => s.name === backup.storage_name);
-        
-        if (!storage) {
-          throw new Error(`Storage ${backup.storage_name} not found`);
-        }
-        
-        // Parse snapshot path from backup_path (format: pbs://root@pam@IP:DATASTORE/ct/148/2025-10-21T19:14:55Z)
-        const snapshotPathMatch = backup.backup_path.match(/pbs:\/\/[^/]+\/(.+)$/);
-        if (!snapshotPathMatch || !snapshotPathMatch[1]) {
-          throw new Error(`Invalid PBS backup path format: ${backup.backup_path}`);
-        }
-        
-        const snapshotPath = snapshotPathMatch[1];
-        
-        await this.restorePBSBackup(server, storage, containerId, snapshotPath, rootfsStorage, async (step, message) => {
-          await addProgress(step, message);
-        });
+        const snapshot = parseLXCSnapshot(backup.backup_path, containerId);
+        const pbsStorage = (await getStorageService().getStorages(server, false)).find(item => item.name === backup.storage_name && item.type === 'pbs');
+        if (!pbsStorage) throw new Error('PBS storage not found on this server');
+        storageIdSchema.parse(pbsStorage.name);
+        const credential = await db.getPBSCredential(serverId, pbsStorage.name);
+        if (!credential) throw new Error('PBS credentials are missing');
+        // Native restoration preserves config, firewall, ID mapping and encryption.
+        assertNativePBSStorage(getPBSConnection(credential, pbsStorage), pbsStorage);
+        const volume = `${pbsStorage.name}:backup/${snapshot}`;
+        const sourceConfig = await runRemoteCommand(server, `pvesm extractconfig ${q(volume)}`, 'Read PBS snapshot configuration', 120);
+        validateRestoreConfig(sourceConfig);
+        sourceOnboot = /^onboot:\s*1\s*$/m.test(sourceConfig) ? 1 : 0;
+        const stagedId = vmidSchema.parse((await runRemoteCommand(server, 'pvesh get /cluster/nextid --output-format json', 'Allocate staging ID', 30)).trim());
+        if (stagedId === containerId) throw new Error('Staging VMID must differ from the original');
+        stagingContainerId = stagedId;
+        await record('pbs_staging');
+        await log('pbs_prepare', `Preparing PBS snapshot in stopped staging container ${stagedId}; original container is unchanged`);
+        // No --force: allocation races must fail without replacing another guest.
+        await runRemoteCommand(server, `pct restore ${stagedId} ${q(volume)} --storage ${q(storage)} --start 0 --onboot 0`, `Prepare PBS staging container ${stagedId}`);
+        await runRemoteCommand(server, `vzdump ${stagedId} --mode stop --compress zstd --dumpdir ${q(`${job}/source`)} --remove 0`, 'Export prepared PBS backup');
+        source = await this.findArchive(server, `${job}/source`, stagedId);
+        await verifyArchive(source);
+        // Clean only a guest whose creation was confirmed successful.
+        await runRemoteCommand(server, `pct destroy ${stagedId}`, `Remove staging container ${stagedId}`, 120);
       } else {
-        // Local or storage backup
-        await addProgress('restoring', 'Restoring container...');
-        await this.restoreLocalBackup(server, containerId, backup.backup_path, rootfsStorage);
+        if (!['local', 'storage'].includes(backup.storage_type)) throw new Error('Unsupported backup type');
+        const name = basename(backup.backup_path);
+        if (!backup.backup_path.startsWith('/') || !new RegExp(`^vzdump-lxc-${containerId}-.+\\.tar(?:\\.(?:zst|gz|lzo|xz|bz2))?$`).test(name) || /[\r\n\0]/.test(backup.backup_path)) throw new Error('Expected an absolute LXC backup archive path');
+        source = `${job}/source/${name}`;
+        await runRemoteCommand(server, `cp --reflink=auto -- ${q(backup.backup_path)} ${q(source)}`, 'Prepare local backup copy');
+        await verifyArchive(source);
       }
-      
-      await addProgress('complete', 'Restore completed successfully');
-      
-      return {
-        success: true,
-        progress,
-      };
+      sourcePath = source;
+      await record('source_prepared');
+      await log('stopping', 'Backup is prepared. Stopping the original to create a recovery archive...');
+      stopped = true;
+      if (wasRunning) await runRemoteCommand(server, `pct stop ${containerId}`, 'Stop original container', 120);
+      if ((await runRemoteCommand(server, `pct status ${containerId}`, 'Verify stopped state', 30)).trim() !== 'status: stopped') throw new Error('Original container is not stopped');
+      if (await runRemoteCommand(server, `cat ${q(`/etc/pve/lxc/${containerId}.conf`)}`, 'Recheck original configuration', 30) !== originalConfig) throw new Error('Container configuration changed during preparation');
+      await runRemoteCommand(server, `vzdump ${containerId} --mode stop --compress zstd --dumpdir ${q(`${job}/original`)} --remove 0`, 'Create original recovery backup');
+      recoveryPath = await this.findArchive(server, `${job}/original`, containerId);
+      await verifyArchive(recoveryPath);
+      await runRemoteCommand(server, `sync -f ${q(recoveryPath)}`, 'Persist recovery archive', 60);
+      await record('recovery_verified');
+      await log('recovery', `Verified original recovery archive retained at ${recoveryPath}`);
+      await record('replacing');
+      // Native replacement keeps VM ACLs/pool membership. Explicit pct destroy
+      // removes them and vzdump cannot recover ACL entries.
+      replacementStarted = true;
+      await runRemoteCommand(server, `pct restore ${containerId} ${q(source)} --storage ${q(storage)} --force 1 --start 0${sourceOnboot === undefined ? '' : ` --onboot ${sourceOnboot}`}`, 'Restore prepared backup');
+      if (validateRestoreConfig(await runRemoteCommand(server, `pct config ${containerId}`, 'Verify restored container', 30)) !== storage) throw new Error('Restored container is not on the expected root disk storage');
+      await record('complete').catch(() => log('warning', 'Restore succeeded but completion manifest could not be updated'));
+      await log('complete', 'Restore completed successfully. Container is stopped; recovery archive is retained.');
+      return { success: true, progress, recoveryPath };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      await addProgress('error', `Error: ${errorMessage}`);
-      
-      return {
-        success: false,
-        error: errorMessage,
-        progress,
-      };
+      uncertain = error instanceof RemoteCommandError && error.uncertain;
+      let message = error instanceof Error ? error.message : 'Restore failed';
+      if (server && replacementStarted && recoveryPath && storage && !uncertain) {
+        await log('rollback', 'Replacement failed. Recovering the original from the verified archive...');
+        try {
+          // Failed replacements were never started. Force handles their partial config.
+          await runRemoteCommand(server, `pct restore ${containerId} ${q(recoveryPath)} --storage ${q(storage)} --force 1 --start 0`, 'Recover original container');
+          if (validateRestoreConfig(await runRemoteCommand(server, `pct config ${containerId}`, 'Verify recovered original', 30)) !== storage) throw new Error('Recovered container storage could not be verified');
+          recovered = true;
+          await record('original_recovered').catch(() => undefined);
+          message += '; original container recovered';
+        } catch (rollbackError) {
+          uncertain ||= rollbackError instanceof RemoteCommandError && rollbackError.uncertain;
+          message += '; automatic recovery failed, manual recovery is required';
+        }
+      }
+      if (server && stopped && wasRunning && (!replacementStarted || recovered) && !uncertain) {
+        try { await runRemoteCommand(server, `pct start ${containerId}`, 'Restart original container', 120); }
+        catch { message += '; original could not be restarted automatically'; }
+      }
+      if (uncertain) message += '; remote completion is unknown: restore lock retained, inspect the host before retrying';
+      if (job) message += `; recovery directory: ${job}`;
+      await log('error', `Error: ${message}`);
+      return { success: false, error: message, progress, recoveryPath };
+    } finally {
+      if (server && remoteLocked && !uncertain) await runRemoteCommand(server, `rmdir ${q(lock)}`, 'Release restore lock', 30).catch(() => undefined);
+      restoreActive = false;
     }
   }
-}
 
-// Singleton instance
-let restoreServiceInstance: RestoreService | null = null;
-
-export function getRestoreService(): RestoreService {
-  if (!restoreServiceInstance) {
-    restoreServiceInstance = new RestoreService();
+  private async findArchive(server: Server, directory: string, vmid: string): Promise<string> {
+    const output = await runRemoteCommand(server, `find ${q(directory)} -maxdepth 1 -type f -name ${q(`vzdump-lxc-${vmid}-*.tar.zst`)} -print`, 'Locate recovery archive', 30);
+    const files = output.trim().split(/\r?\n/);
+    if (files.length !== 1 || !files[0]?.startsWith(`${directory}/`) || files[0].includes('/../') || !/^vzdump-lxc-\d+-[A-Za-z0-9_.:-]+\.tar\.zst$/.test(basename(files[0]))) throw new Error('Expected exactly one recovery archive in the private job directory');
+    return files[0];
   }
-  return restoreServiceInstance;
 }
 
-
+let restoreServiceInstance: RestoreService | undefined;
+export function getRestoreService(): RestoreService { return restoreServiceInstance ??= new RestoreService(); }

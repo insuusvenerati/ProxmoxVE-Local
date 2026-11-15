@@ -7,6 +7,10 @@ export interface Storage {
   content: string[];
   supportsBackup: boolean;
   nodes?: string[];
+  server?: string;
+  datastore?: string;
+  username?: string;
+  namespace?: string;
   [key: string]: any; // For additional storage-specific properties
 }
 

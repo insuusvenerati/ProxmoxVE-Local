@@ -3,8 +3,10 @@ import { parse } from 'url';
 import next from 'next';
 import { WebSocketServer } from 'ws';
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
-import { join, resolve } from 'path';
+import { existsSync, realpathSync } from 'fs';
+import { join, relative, basename } from 'path';
+import { resolveScriptPath } from './src/server/lib/scriptPath.js';
+import { quoteShellArgument } from './src/server/services/backupPath';
 import stripAnsi from 'strip-ansi';
 import { spawn as ptySpawn } from 'node-pty';
 import { getSSHExecutionService } from './src/server/ssh-execution-service.js';
@@ -544,7 +546,9 @@ class ScriptExecutionHandler {
       }
 
       // Extract script name from path
-      const scriptName = scriptPath.split('/').pop() ?? scriptPath.split('\\').pop() ?? 'Unknown Script';
+      // Validate before branching to SSH as well as local execution.
+      scriptPath = resolveScriptPath(scriptPath, join(process.cwd(), 'scripts'));
+      const scriptName = basename(scriptPath);
 
       // Create installation record
       const serverId = server ? (server.id ?? null) : null;
@@ -566,21 +570,7 @@ class ScriptExecutionHandler {
 
       // Basic validation for local execution
       const scriptsDir = join(process.cwd(), 'scripts');
-      const resolvedPath = resolve(scriptPath);
-
-      if (!resolvedPath.startsWith(resolve(scriptsDir))) {
-        this.sendMessage(ws, {
-          type: 'error',
-          data: 'Script path is not within the allowed scripts directory',
-          timestamp: Date.now()
-        });
-
-        // Update installation record with failure
-        if (installationId) {
-          await this.updateInstallationRecord(installationId, { status: 'failed' });
-        }
-        return;
-      }
+      const resolvedPath = resolveScriptPath(scriptPath, scriptsDir);
 
       // Format environment variables for local execution
       // Convert envVars object to environment variables
@@ -731,20 +721,15 @@ class ScriptExecutionHandler {
       // Guard against path traversal — every script must resolve inside the
       // scripts directory, regardless of execution mode (local or SSH).
       const guardScriptsDir = join(process.cwd(), 'scripts');
-      const resolvedScriptPath = resolve(scriptPath);
-      if (!resolvedScriptPath.startsWith(resolve(guardScriptsDir))) {
-        this.sendMessage(ws, { type: 'error', data: 'Script path outside scripts directory', timestamp: Date.now() });
-        return;
-      }
-
-      const scriptName = scriptPath.split('/').pop() ?? scriptPath.split('\\').pop() ?? 'Unknown Script';
+      const resolvedScriptPath = resolveScriptPath(scriptPath, guardScriptsDir);
+      const scriptName = basename(resolvedScriptPath);
       const serverId = server ? (server.id ?? null) : null;
       installationId = await this.createInstallationRecord(scriptName, scriptPath, mode, serverId, containerId ?? null);
 
       // Build env-var export prefix
       const envExports = Object.entries(envVars ?? {})
         .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
-        .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+        .map(([k, v]) => `export ${k}=${quoteShellArgument(String(v))}`)
         .join('; ');
       const envPrefix = `${NEWT_COLORS_EXPORT}; ${envExports ? `${envExports}; ` : ''}`;
 
@@ -753,7 +738,7 @@ class ScriptExecutionHandler {
         const sshService = getSSHExecutionService();
         this.sendMessage(ws, { type: 'start', data: `Connecting to ${server.ip}…`, timestamp: Date.now() });
 
-        const relScript = scriptPath.replace(/^scripts[/\\]/, '');
+        const relScript = relative(realpathSync(guardScriptsDir), resolvedScriptPath).replace(/\\/g, '/');
         const remoteScript = `/tmp/scripts/${relScript}`;
 
         // Transfer scripts folder silently — suppress verbose rsync file listing
@@ -774,7 +759,7 @@ class ScriptExecutionHandler {
           // For LXC we must copy the script from host (/tmp/scripts/...) into the container first.
           // Otherwise pct exec tries to run a host path that does not exist inside the CT.
           const remoteTarget = `/tmp/${scriptName}`;
-          const pushCmd = `pct push ${containerId} ${remoteScript} ${remoteTarget}`;
+          const pushCmd = `pct push ${containerId} ${quoteShellArgument(remoteScript)} ${quoteShellArgument(remoteTarget)}`;
 
           // Run pct push silently (no terminal output needed for this bookkeeping step)
           await new Promise((resolve, reject) => {
@@ -788,10 +773,10 @@ class ScriptExecutionHandler {
             );
           });
 
-          inContainerCmd = `pct exec ${containerId} -- bash -c "chmod +x ${remoteTarget}; ${envPrefix}bash ${remoteTarget}"`;
+          inContainerCmd = `pct exec ${containerId} -- bash -c ${quoteShellArgument(`${envPrefix}bash ${quoteShellArgument(remoteTarget)}`)}`;
         } else {
           // VM execution currently relies on guest exec and assumes script path exists in guest context.
-          inContainerCmd = `qm guest exec ${containerId} -- bash -c "${envPrefix}bash ${remoteScript}"`;
+          inContainerCmd = `qm guest exec ${containerId} -- bash -c ${quoteShellArgument(`${envPrefix}bash ${quoteShellArgument(remoteScript)}`)}`;
         }
 
         this.activeExecutions.set(executionId, { process: null, ws, installationId, outputBuffer: '' });
@@ -832,14 +817,8 @@ class ScriptExecutionHandler {
 
       // Local mode: pipe the script content into `pct exec <ctid> -- bash`
       const scriptsDir = join(process.cwd(), 'scripts');
-      const resolvedPath = resolve(scriptPath);
-      if (!resolvedPath.startsWith(resolve(scriptsDir))) {
-        this.sendMessage(ws, { type: 'error', data: 'Script path outside scripts directory', timestamp: Date.now() });
-        if (installationId) await this.updateInstallationRecord(installationId, { status: 'failed' });
-        return;
-      }
-
-      const bashCmd = `${envPrefix}bash ${resolvedPath}`;
+      const resolvedPath = resolveScriptPath(scriptPath, scriptsDir);
+      const bashCmd = `${envPrefix}bash ${quoteShellArgument(resolvedPath)}`;
       const args = containerType === 'lxc'
         ? ['exec', containerId, '--', 'bash', '-c', bashCmd]
         : ['guest', 'exec', containerId, '--', 'bash', '-c', bashCmd];

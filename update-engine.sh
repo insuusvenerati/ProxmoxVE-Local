@@ -10,8 +10,9 @@ set -euo pipefail # Exit on error, undefined vars, pipe failures
 trap 'echo "Error occurred at line $LINENO, command: $BASH_COMMAND"' ERR
 
 # Configuration
-REPO_OWNER="community-scripts"
-REPO_NAME="ProxmoxVE-Local"
+# PVE_LOCAL_UPDATE_SOURCE_V1
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/update-source.sh"
+pve_local_update_source "$(dirname "${BASH_SOURCE[0]}")/.env"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
 BACKUP_DIR="/tmp/pve-scripts-backup-$(date +%Y%m%d-%H%M%S)"
 DATA_DIR="./data"
@@ -19,7 +20,7 @@ LOG_FILE="/tmp/update.log"
 
 # GitHub Personal Access Token for higher rate limits (optional)
 # Set GITHUB_TOKEN environment variable or create .github_token file
-GITHUB_TOKEN=""
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 # Global variable to track if service was running before update
 SERVICE_WAS_RUNNING=false
@@ -144,11 +145,11 @@ get_release() {
 
 	log "Fetching latest release information from GitHub (including pre-releases)..."
 
-	local curl_opts="-s --connect-timeout 15 --max-time 60 --retry 2 --retry-delay 3"
+	local curl_opts=(-fsSL --connect-timeout 15 --max-time 60 --retry 2 --retry-delay 3)
 
 	# Add authentication header if token is available
 	if [ -n "$GITHUB_TOKEN" ]; then
-		curl_opts="$curl_opts -H \"Authorization: token $GITHUB_TOKEN\""
+		curl_opts+=(-H "Authorization: token $GITHUB_TOKEN")
 		log "Using authenticated GitHub API request"
 	else
 		log "Using unauthenticated GitHub API request (lower rate limits)"
@@ -156,7 +157,7 @@ get_release() {
 
 	# Fetch all releases (includes pre-releases) sorted by newest first
 	local releases_json
-	if ! releases_json=$(eval "curl $curl_opts \"$GITHUB_API/releases?per_page=5\""); then
+	if ! releases_json=$(curl "${curl_opts[@]}" "$GITHUB_API/releases?per_page=100"); then
 		log_error "Failed to fetch release information from GitHub API (timeout or network error)"
 		exit 1
 	fi
@@ -170,7 +171,7 @@ get_release() {
 
 	# Pick the first (newest) release — this includes pre-releases
 	local release_info
-	release_info=$(echo "$releases_json" | jq '.[0]')
+	release_info=$(echo "$releases_json" | jq --arg allow "${ALLOW_PRERELEASE:-false}" '[.[] | select(.draft != true) | select($allow == "true" or .prerelease != true)] | sort_by(.published_at) | reverse | .[0]')
 
 	local tag_name
 	local download_url
@@ -314,6 +315,10 @@ download_release() {
 	fi
 
 	log_success "Release extracted successfully to $(basename "$extracted_dir")"
+	if [ ! -f "$extracted_dir/update-source.sh" ] || ! grep -q '^# PVE_LOCAL_UPDATE_SOURCE_V1$' "$extracted_dir/update-engine.sh"; then
+		log_error "Release lacks fork-aware updates. Refusing to replace this installation."
+		exit 1
+	fi
 	echo "$extracted_dir"
 }
 
@@ -338,6 +343,8 @@ clear_original_directory() {
 		"scripts"
 		"update.sh"
 		"update-engine.sh"
+		"update-source.sh"
+		"UPDATER_VERSION.source"
 		"UPDATER_VERSION"
 	)
 
@@ -590,6 +597,8 @@ update_files() {
 		"*.bak"
 		"update.sh"
 		"update-engine.sh"
+		"update-source.sh"
+		"UPDATER_VERSION.source"
 		"UPDATER_VERSION"
 		"scripts/ct"
 		"scripts/install"
@@ -1011,12 +1020,19 @@ main() {
 		v*)
 			target_version="$1"
 			;;
+		--version)
+			shift
+			target_version="${1:?Missing release tag}"
+			;;
 		*)
 			log_warning "Unknown argument: $1"
 			;;
 		esac
 		shift
 	done
+	if [ -n "$target_version" ] && [[ ! "$target_version" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+		log_error "Invalid release tag"; exit 1
+	fi
 
 	if [ -n "${PVE_UPDATE_RELOCATED:-}" ]; then
 		init_log
@@ -1029,9 +1045,9 @@ main() {
 	# Check if we're running from the application directory and not already relocated
 	if [ -z "${PVE_UPDATE_RELOCATED:-}" ] && [ -f "package.json" ] && [ -f "server.js" ]; then
 		log "Detected running from application directory"
-		local args="--relocated"
-		[ -n "$target_version" ] && args="$args $target_version"
-		bash "$0" $args
+		local args=(--relocated)
+		[ -n "$target_version" ] && args+=(--version "$target_version")
+		bash "$0" "${args[@]}"
 		exit $?
 	fi
 
@@ -1059,7 +1075,7 @@ main() {
 	check_dependencies
 
 	# Load GitHub token for higher rate limits
-	load_github_token
+	load_github_token || true
 
 	# Check if service was running before update
 	if check_service && systemctl is-active --quiet pvescriptslocal.service; then
@@ -1070,7 +1086,10 @@ main() {
 
 	# Get release info (specific version or latest)
 	local release_info
-	release_info=$(get_release "$target_version")
+	release_info=$(get_release "$target_version") || return 1
+	# Download and validate the release before stopping or changing this installation.
+	local source_dir
+	source_dir=$(download_release "$release_info") || return 1
 
 	# Backup data directory
 	backup_data
@@ -1080,10 +1099,6 @@ main() {
 
 	# Check Node.js version
 	check_node_version
-
-	# Download and extract release
-	local source_dir
-	source_dir=$(download_release "$release_info")
 
 	# Clear the original directory before updating
 	clear_original_directory
@@ -1128,7 +1143,9 @@ main() {
 }
 
 # Run main function with error handling
-if ! main "$@"; then
-	log_error "Update script failed with exit code $?"
-	exit 1
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	if ! main "$@"; then
+		log_error "Update script failed"
+		exit 1
+	fi
 fi

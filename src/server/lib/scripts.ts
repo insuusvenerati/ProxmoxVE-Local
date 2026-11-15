@@ -1,8 +1,10 @@
 import { readdir, stat, readFile, access } from 'fs/promises';
-import { join, resolve, extname } from 'path';
+import { join, relative, extname } from 'path';
+import { realpathSync } from 'fs';
 import { env } from '~/env.js';
 import { spawn, type ChildProcess } from 'child_process';
 import { NEWT_COLORS_VALUE } from '../newt-colors.js';
+import { resolveScriptPath } from './scriptPath.js';
 
 export interface ScriptInfo {
   name: string;
@@ -271,19 +273,16 @@ export class ScriptManager {
    */
   validateScriptPath(scriptPath: string): { valid: boolean; message?: string } {
     this.initializeConfig();
-    const resolvedPath = resolve(scriptPath);
-    const scriptsDirResolved = resolve(this.scriptsDir!);
-
-    // Check if the script is within the allowed directory
-    if (!resolvedPath.startsWith(scriptsDirResolved)) {
-      return {
-        valid: false,
-        message: 'Script path is not within the allowed scripts directory'
-      };
+    let resolvedPath: string;
+    try {
+      resolvedPath = resolveScriptPath(scriptPath, this.scriptsDir!);
+    } catch (error) {
+      return { valid: false, message: error instanceof Error ? error.message : 'Invalid script path' };
     }
+    const scriptsDirResolved = realpathSync(this.scriptsDir!);
 
     // Check if the script path matches any allowed path pattern
-    const relativePath = resolvedPath.replace(scriptsDirResolved, '').replace(/\\/g, '/');
+    const relativePath = relative(scriptsDirResolved, resolvedPath).replace(/\\/g, '/');
     const normalizedRelativePath = relativePath.startsWith('/') ? relativePath : '/' + relativePath;
     
     const isAllowed = this.allowedPaths!.some(allowedPath => {
