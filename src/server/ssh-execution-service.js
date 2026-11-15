@@ -1,7 +1,9 @@
 import { spawn } from 'child_process';
 import { spawn as ptySpawn } from 'node-pty';
-import { existsSync, writeFileSync, chmodSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { existsSync, writeFileSync, chmodSync, unlinkSync, realpathSync } from 'fs';
+import { join, relative } from 'path';
+import { resolveScriptPath } from './lib/scriptPath.js';
+import { quoteShellArgument } from './services/backupPath';
 import { tmpdir } from 'os';
 import { NEWT_COLORS_EXPORT } from './newt-colors.js';
 
@@ -92,6 +94,9 @@ class SSHExecutionService {
    */
   async executeScript(server, scriptPath, onData, onError, onExit, envVars = {}, cols = 220, rows = 50) {
     try {
+      const scriptsDirectory = realpathSync(join(process.cwd(), 'scripts'));
+      const resolvedScript = resolveScriptPath(scriptPath, scriptsDirectory);
+      const relativeScriptPath = quoteShellArgument(relative(scriptsDirectory, resolvedScript).replace(/\\/g, '/'));
       // Suppress verbose rsync file-listing output; only forward real errors
       await this.transferScriptsFolder(
         server,
@@ -104,7 +109,6 @@ class SSHExecutionService {
       );
 
       return new Promise((resolve, reject) => {
-        const relativeScriptPath = scriptPath.startsWith('scripts/') ? scriptPath.substring(8) : scriptPath;
 
         try {
           // Build SSH command based on authentication type
