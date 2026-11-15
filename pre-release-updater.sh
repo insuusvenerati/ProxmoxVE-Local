@@ -21,10 +21,12 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-REPO_OWNER="community-scripts"
-REPO_NAME="ProxmoxVE-Local"
-GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
-INSTALL_DIR="/opt/ProxmoxVE-Local"
+INSTALL_DIR="${INSTALL_DIR:-/opt/ProxmoxVE-Local}"
+UPDATE_SOURCE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/update-source.sh"
+if [ ! -f "$UPDATE_SOURCE_FILE" ]; then UPDATE_SOURCE_FILE="${INSTALL_DIR}/update-source.sh"; fi
+source "$UPDATE_SOURCE_FILE"
+pve_local_update_source "${INSTALL_DIR}/.env"
+GITHUB_API="https://api.github.com/repos/${APP_UPDATE_REPOSITORY}"
 BACKUP_DIR="/tmp/pve-prerelease-backup-$(date +%Y%m%d-%H%M%S)"
 SERVICE_NAME="pve-scripts-local"
 
@@ -81,15 +83,15 @@ get_current_version() {
 fetch_prereleases() {
 	msg "Fetching available pre-releases from GitHub..." >&2
 
-	local curl_opts="-fsSL --connect-timeout 15 --max-time 30"
+	local curl_opts=(-fsSL --connect-timeout 15 --max-time 30)
 
 	# Add token if available
 	if [ -n "${GITHUB_TOKEN:-}" ]; then
-		curl_opts="$curl_opts -H \"Authorization: token $GITHUB_TOKEN\""
+		curl_opts+=(-H "Authorization: token $GITHUB_TOKEN")
 	fi
 
 	local releases_json
-	if ! releases_json=$(eval "curl $curl_opts \"${GITHUB_API}/releases?per_page=20\""); then
+	if ! releases_json=$(curl "${curl_opts[@]}" "${GITHUB_API}/releases?per_page=20"); then
 		msg_err "Failed to fetch releases from GitHub API"
 		msg_err "Check your internet connection or try again later."
 		exit 1
@@ -259,6 +261,11 @@ install_prerelease() {
 	fi
 
 	# Stop service if running
+	if [ ! -f "$extracted_dir/update-source.sh" ] || ! grep -q '^# PVE_LOCAL_UPDATE_SOURCE_V1$' "$extracted_dir/update-engine.sh"; then
+		msg_err "Release lacks fork-aware updates. Aborting before changing the installation."
+		exit 1
+	fi
+
 	local service_was_running=false
 	if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
 		msg "Stopping ${SERVICE_NAME} service..."

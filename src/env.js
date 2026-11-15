@@ -17,6 +17,8 @@ export const env = createEnv({
     REPO_URL: z.string().url().optional(),
    
     REPO_BRANCH: z.string().default("main"),
+    APP_UPDATE_REPOSITORY: z.string().optional(),
+    APP_UPDATE_BRANCH: z.string().optional(),
     SCRIPTS_DIRECTORY: z.string().default("scripts"),
     ALLOWED_SCRIPT_EXTENSIONS: z.string().default(".sh,.py,.js,.ts,.bash"),
     // Security
@@ -63,6 +65,8 @@ export const env = createEnv({
     REPO_URL: process.env.REPO_URL,
    
     REPO_BRANCH: process.env.REPO_BRANCH,
+    APP_UPDATE_REPOSITORY: process.env.APP_UPDATE_REPOSITORY,
+    APP_UPDATE_BRANCH: process.env.APP_UPDATE_BRANCH,
     SCRIPTS_DIRECTORY: process.env.SCRIPTS_DIRECTORY,
     ALLOWED_SCRIPT_EXTENSIONS: process.env.ALLOWED_SCRIPT_EXTENSIONS,
     // Security

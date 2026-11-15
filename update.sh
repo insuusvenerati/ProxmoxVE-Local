@@ -13,11 +13,10 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-REPO_OWNER="community-scripts"
-REPO_NAME="ProxmoxVE-Local"
-RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/update-source.sh"
+pve_local_update_source "${SCRIPT_DIR}/.env"
+RAW_BASE="https://raw.githubusercontent.com/${APP_UPDATE_REPOSITORY}/${APP_UPDATE_BRANCH//\//%2F}"
 ENGINE_FILE="${SCRIPT_DIR}/update-engine.sh"
 LOCAL_VERSION_FILE="${SCRIPT_DIR}/UPDATER_VERSION"
 
@@ -60,7 +59,7 @@ self_update() {
     fi
 
     # Compare versions
-    if [ "$local_version" = "$remote_version" ]; then
+    if [ "$local_version" = "$remote_version" ] && [ -f "${LOCAL_VERSION_FILE}.source" ] && [ "$(cat "${LOCAL_VERSION_FILE}.source")" = "$RAW_BASE" ]; then
         msg_ok "Update engine is current (v${local_version})"
         return 0
     fi
@@ -86,12 +85,20 @@ self_update() {
         exit 1
     fi
 
+    # Older engines hardcode upstream and cannot honor a fork's selected source.
+    if ! grep -q '^# PVE_LOCAL_UPDATE_SOURCE_V1$' "$tmp_engine"; then
+        rm -f "$tmp_engine"
+        msg_err "Downloaded engine does not support fork-aware updates. Publish a compatible release first."
+        exit 1
+    fi
+    bash -n "$tmp_engine"
     # Atomic replace
     chmod +x "$tmp_engine"
     mv -f "$tmp_engine" "$ENGINE_FILE"
 
     # Update local version file
     echo "$remote_version" > "$LOCAL_VERSION_FILE"
+    printf '%s\n' "$RAW_BASE" > "${LOCAL_VERSION_FILE}.source"
 
     # Also download the new UPDATER_VERSION (in case the bootstrap itself
     # needs to be aware of schema changes in future versions)
@@ -109,6 +116,11 @@ main() {
     if [ ! -f "$ENGINE_FILE" ]; then
         msg_err "update-engine.sh not found at: $ENGINE_FILE"
         msg_err "This should not happen. Re-download the release manually."
+        exit 1
+    fi
+
+    if ! grep -q '^# PVE_LOCAL_UPDATE_SOURCE_V1$' "$ENGINE_FILE"; then
+        msg_err "Local engine does not support fork-aware updates. Aborting."
         exit 1
     fi
 

@@ -44,6 +44,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 update.log
+UPDATER_VERSION.source
 server.log
 
 # local env files

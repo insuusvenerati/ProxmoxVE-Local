@@ -5,6 +5,13 @@ import { spawn } from "child_process";
 import { env } from "~/env";
 import { existsSync, createWriteStream } from "fs";
 import stripAnsi from "strip-ansi";
+import { z } from 'zod';
+import { getApplicationUpdateSource } from '~/server/services/applicationUpdateSource';
+
+const applicationReleaseSchema = z.object({
+  tag_name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/),
+  published_at: z.string(), draft: z.boolean().optional().default(false),
+});
 
 interface GitHubRelease {
   tag_name: string;
@@ -58,14 +65,14 @@ export const versionRouter = createTRPCRouter({
         let release: GitHubRelease;
 
         if (allowPrerelease) {
-          const response = await fetchGitHubAPI('https://api.github.com/repos/community-scripts/ProxmoxVE-Local/releases');
+          const response = await fetchGitHubAPI(`${getApplicationUpdateSource().api}/releases`);
           if (!response.ok) throw new Error(`GitHub API error: ${response.status}`);
           const releases: GitHubRelease[] = await response.json();
           const sorted = releases.sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime());
           if (!sorted[0]) throw new Error('No releases found');
           release = sorted[0];
         } else {
-          const response = await fetchGitHubAPI('https://api.github.com/repos/community-scripts/ProxmoxVE-Local/releases/latest');
+          const response = await fetchGitHubAPI(`${getApplicationUpdateSource().api}/releases/latest`);
           if (!response.ok) throw new Error(`GitHub API error: ${response.status}`);
           release = await response.json();
         }
@@ -100,14 +107,14 @@ export const versionRouter = createTRPCRouter({
         let release: GitHubRelease;
 
         if (allowPrerelease) {
-          const response = await fetchGitHubAPI('https://api.github.com/repos/community-scripts/ProxmoxVE-Local/releases');
+          const response = await fetchGitHubAPI(`${getApplicationUpdateSource().api}/releases`);
           if (!response.ok) throw new Error(`GitHub API error: ${response.status}`);
           const releases: GitHubRelease[] = await response.json();
           const sorted = releases.sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime());
           if (!sorted[0]) throw new Error('No releases found');
           release = sorted[0];
         } else {
-          const response = await fetchGitHubAPI('https://api.github.com/repos/community-scripts/ProxmoxVE-Local/releases/latest');
+          const response = await fetchGitHubAPI(`${getApplicationUpdateSource().api}/releases/latest`);
           if (!response.ok) throw new Error(`GitHub API error: ${response.status}`);
           release = await response.json();
         }
@@ -148,7 +155,7 @@ export const versionRouter = createTRPCRouter({
   getAllReleases: publicProcedure
     .query(async () => {
       try {
-        const response = await fetchGitHubAPI('https://api.github.com/repos/community-scripts/ProxmoxVE-Local/releases');
+        const response = await fetchGitHubAPI(`${getApplicationUpdateSource().api}/releases`);
         
         if (!response.ok) {
           throw new Error(`GitHub API error: ${response.status}`);
@@ -253,51 +260,38 @@ export const versionRouter = createTRPCRouter({
         // Clear/create the log file
         await writeFile(logPath, '', 'utf-8');
         
-        // Determine which branch to fetch update.sh from.
-        // Prerelease installs live on the v1.0.0 branch; stable installs on main.
-        // Fetching from the wrong branch would downgrade a prerelease to stable.
-        let updateBranch = 'main';
-        try {
-          const versionPath = join(process.cwd(), 'VERSION');
-          const currentVersion = (await readFile(versionPath, 'utf-8')).trim();
-          if (currentVersion.includes('pre')) {
-            updateBranch = 'v1.0.0';
-          }
-        } catch {
-          // If VERSION can't be read, fall back to main
-        }
-        const updateScriptUrl = `https://raw.githubusercontent.com/community-scripts/ProxmoxVE-Local/${updateBranch}/update.sh`;
-        try {
-          const response = await fetch(updateScriptUrl);
-          if (response.ok) {
-            const latestScript = await response.text();
-            await writeFile(updateScriptPath, latestScript, { mode: 0o755 });
-            // Log that we fetched the latest script
-            await writeFile(logPath, '[INFO] Fetched latest update.sh from GitHub\n', { flag: 'a' });
-          } else {
-            // If fetch fails, log warning but continue with local script
-            await writeFile(logPath, `[WARNING] Could not fetch latest update.sh (HTTP ${response.status}), using local version\n`, { flag: 'a' });
-          }
-        } catch (fetchError) {
-          // If fetch fails, log warning but continue with local script
-          const errorMsg = fetchError instanceof Error ? fetchError.message : 'Unknown error';
-          await writeFile(logPath, `[WARNING] Could not fetch latest update.sh: ${errorMsg}, using local version\n`, { flag: 'a' });
-        }
-        
+        const source = getApplicationUpdateSource();
+        const bootstrap = await readFile(updateScriptPath, 'utf8');
+        if (!bootstrap.includes('pve_local_update_source')) throw new Error('Local updater does not support fork-aware updates');
+        const allowPrerelease = env.ALLOW_PRERELEASE === 'true';
+        const response = await fetchGitHubAPI(`${source.api}/releases${allowPrerelease ? '' : '/latest'}`);
+        if (!response.ok) throw new Error(`No application release available from ${source.repository} (HTTP ${response.status})`);
+        const payload: unknown = await response.json();
+        const release = allowPrerelease
+          ? applicationReleaseSchema.array().parse(payload).filter(item => !item.draft).sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))[0]
+          : applicationReleaseSchema.parse(payload);
+        if (!release) throw new Error('No application releases found');
+        const tag = release.tag_name;
+        await writeFile(logPath, `[INFO] Updating application from ${source.repository} release ${tag}\n`, { flag: 'a' });
         // Spawn the update script as a detached process using nohup
         // This allows it to run independently and kill the parent Node.js process
         // Redirect output to log file
-        const child = spawn('bash', [updateScriptPath], {
+        const child = spawn('bash', [updateScriptPath, '--version', tag], {
           cwd: process.cwd(),
           stdio: ['ignore', 'pipe', 'pipe'],
           shell: false,
-          detached: true
+          detached: true,
+          env: { ...process.env, APP_UPDATE_REPOSITORY: source.repository, APP_UPDATE_BRANCH: source.branch }
         });
 
         // Capture stdout and stderr to log file
         const logStream = createWriteStream(logPath, { flags: 'a' });
         child.stdout?.pipe(logStream);
         child.stderr?.pipe(logStream);
+        await new Promise<void>((resolve, reject) => {
+          child.once('spawn', resolve);
+          child.once('error', reject);
+        });
 
         // Unref the child process so it doesn't keep the parent alive
         child.unref();
