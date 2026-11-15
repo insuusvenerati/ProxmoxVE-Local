@@ -1,5 +1,8 @@
 /* eslint-disable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return -- Prisma raw results are typed as any throughout this router */
 import { z } from "zod";
+import { hostnameSchema, lxcConfigSchema, storageIdSchema, vmidSchema, volumeIdSchema } from '~/server/lib/proxmoxValidation';
+import { buildConfigWriteCommand } from '~/server/lib/proxmoxCommands';
+import { quoteShellArgument } from '~/server/services/backupPath';
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
 import { getDatabase } from "~/server/database-prisma";
 import { createHash } from "crypto";
@@ -147,9 +150,9 @@ function calculateConfigHash(rawConfig: string): string {
 // Helper function to parse rootfs_storage and extract storage pool and disk identifier
 function parseRootfsStorage(rootfs_storage: string): { storagePool: string; diskId: string } | null {
   // Format: "PROX2-STORAGE2:vm-113-disk-0"
-  const regex = /^([^:]+):(.+)$/;
+  const regex = /^([A-Za-z][A-Za-z0-9_.-]*):([A-Za-z0-9_.\/-]+)$/;
   const match = regex.exec(rootfs_storage);
-  if (!match?.[1] || !match?.[2]) return null;
+  if (!match?.[1] || !match?.[2] || !volumeIdSchema.safeParse(rootfs_storage).success) return null;
 
   return {
     storagePool: match[1],
@@ -258,14 +261,14 @@ async function tryLVMResize(
 
   // Try LVM resize commands
   const lvPath = `/dev/${storageInfo.storagePool}/${storageInfo.diskId}`;
-  const lvresizeCommand = `lvresize -L ${newSizeGB}G ${lvPath}`;
+  const lvresizeCommand = `lvresize -L ${newSizeGB}G ${quoteShellArgument(lvPath)}`;
 
   void sshExecutionService.executeCommand(
     server,
     lvresizeCommand,
     (_data: string) => {
       // Now resize the filesystem
-      const resize2fsCommand = `resize2fs ${lvPath}`;
+      const resize2fsCommand = `resize2fs ${quoteShellArgument(lvPath)}`;
 
       void sshExecutionService.executeCommand(
         server,
@@ -278,7 +281,7 @@ async function tryLVMResize(
         },
         (fsError: string) => {
           // Try xfs_growfs as fallback
-          const xfsCommand = `xfs_growfs ${lvPath}`;
+          const xfsCommand = `xfs_growfs ${quoteShellArgument(lvPath)}`;
 
           void sshExecutionService.executeCommand(
             server,
@@ -320,7 +323,7 @@ async function tryLVMResize(
             });
           } else {
             // Try xfs_growfs as fallback
-            const xfsCommand = `xfs_growfs ${lvPath}`;
+            const xfsCommand = `xfs_growfs ${quoteShellArgument(lvPath)}`;
 
             void sshExecutionService.executeCommand(
               server,
@@ -386,6 +389,7 @@ async function tryLVMResize(
 
 // Helper function to determine if a container is a VM or LXC
 async function isVM(scriptId: number, containerId: string, serverId: number | null): Promise<boolean> {
+  vmidSchema.parse(containerId);
   const db = getDatabase();
 
   // Method 1: Check if LXCConfig exists (if exists, it's an LXC container)
@@ -446,7 +450,7 @@ async function isVM(scriptId: number, containerId: string, serverId: number | nu
         let exists = false;
         void sshExecutionService.executeCommand(
           server as Server,
-          `test -f "${path}" && echo "exists" || echo "not_found"`,
+          `test -f ${quoteShellArgument(path)} && echo "exists" || echo "not_found"`,
           (data: string) => {
             if (data.trim() === 'exists') exists = true;
           },
@@ -749,6 +753,7 @@ export const installedScriptsRouter = createTRPCRouter({
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.id);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
         if (!script) {
           return {
             success: false,
@@ -799,7 +804,7 @@ export const installedScriptsRouter = createTRPCRouter({
     .input(z.object({
       script_name: z.string(),
       script_path: z.string(),
-      container_id: z.string().optional(),
+      container_id: vmidSchema.optional(),
       server_id: z.number().optional(),
       execution_mode: z.enum(['local', 'ssh']),
       status: z.enum(['in_progress', 'success', 'failed']),
@@ -830,7 +835,7 @@ export const installedScriptsRouter = createTRPCRouter({
     .input(z.object({
       id: z.number(),
       script_name: z.string().optional(),
-      container_id: z.string().optional(),
+      container_id: vmidSchema.optional(),
       status: z.enum(['in_progress', 'success', 'failed']).optional(),
       output_log: z.string().optional(),
       web_ui_ip: z.string().optional(),
@@ -1031,7 +1036,7 @@ export const installedScriptsRouter = createTRPCRouter({
             ? `/etc/pve/nodes/${nodeName}/qemu-server/${id}.conf`
             : `/etc/pve/nodes/${nodeName}/lxc/${id}.conf`;
 
-          const readCommand = `cat "${configPath}" 2>/dev/null`;
+          const readCommand = `cat ${quoteShellArgument(configPath)} 2>/dev/null`;
 
           return new Promise<any>((resolve) => {
             let configData = '';
@@ -1416,13 +1421,13 @@ export const installedScriptsRouter = createTRPCRouter({
             // Check each script against the list of existing containers and VMs
             for (const scriptData of serverScripts) {
               try {
-                const containerId = String(scriptData.container_id).trim();
+                const containerId = vmidSchema.parse(String(scriptData.container_id).trim());
 
                 // Check if ID exists in either pct list (containers) or qm list (VMs)
                 if (!existingIds.has(containerId)) {
                   // Also verify config file doesn't exist as a double-check (node-specific paths)
-                  const checkContainerCommand = `test -f "/etc/pve/nodes/${nodeName}/lxc/${containerId}.conf" && echo "exists" || echo "not_found"`;
-                  const checkVMCommand = `test -f "/etc/pve/nodes/${nodeName}/qemu-server/${containerId}.conf" && echo "exists" || echo "not_found"`;
+                  const checkContainerCommand = `test -f ${quoteShellArgument(`/etc/pve/nodes/${nodeName}/lxc/${containerId}.conf`)} && echo "exists" || echo "not_found"`;
+                  const checkVMCommand = `test -f ${quoteShellArgument(`/etc/pve/nodes/${nodeName}/qemu-server/${containerId}.conf`)} && echo "exists" || echo "not_found"`;
 
                   const configExists = await new Promise<boolean>((resolve) => {
                     let combinedOutput = '';
@@ -1695,6 +1700,7 @@ export const installedScriptsRouter = createTRPCRouter({
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.id);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           return {
@@ -1802,6 +1808,7 @@ export const installedScriptsRouter = createTRPCRouter({
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.id);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           return {
@@ -1911,6 +1918,7 @@ export const installedScriptsRouter = createTRPCRouter({
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.id);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           return {
@@ -2082,6 +2090,7 @@ export const installedScriptsRouter = createTRPCRouter({
         console.log('🔍 Auto-detect WebUI called with id:', input.id);
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.id);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           console.log('❌ Script not found for id:', input.id);
@@ -2298,6 +2307,7 @@ export const installedScriptsRouter = createTRPCRouter({
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.scriptId);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           return {
@@ -2421,12 +2431,13 @@ export const installedScriptsRouter = createTRPCRouter({
   saveLXCConfig: publicProcedure
     .input(z.object({
       scriptId: z.number(),
-      config: z.any()
+      config: lxcConfigSchema
     }))
     .mutation(async ({ input }) => {
       try {
         const db = getDatabase();
         const script = await db.getInstalledScriptById(input.scriptId);
+        if (script?.container_id) vmidSchema.parse(script.container_id);
 
         if (!script) {
           return {
@@ -2530,9 +2541,7 @@ export const installedScriptsRouter = createTRPCRouter({
           };
         }
 
-        const writeCommand = `cat > "${configPath}" << 'EOFCONFIG'
-${rawConfig}
-EOFCONFIG`;
+        const writeCommand = buildConfigWriteCommand(configPath, rawConfig);
 
         await new Promise<void>((resolve, reject) => {
           void sshExecutionService.executeCommand(
@@ -2561,9 +2570,7 @@ EOFCONFIG`;
           const storageInfo = parseRootfsStorage(String(input.config.rootfs_storage));
           if (!storageInfo) {
             // Rollback config file
-            const rollbackCommand = `cat > "${configPath}" << 'EOFCONFIG'
-${reconstructConfig(currentConfig ?? {})}
-EOFCONFIG`;
+            const rollbackCommand = buildConfigWriteCommand(configPath, reconstructConfig(currentConfig ?? {}));
 
             await new Promise<void>((resolve, reject) => {
               void sshExecutionService.executeCommand(
@@ -2593,9 +2600,7 @@ EOFCONFIG`;
             if (!resizeResult.success) {
               console.log('Resize failed, attempting rollback...');
               // Rollback config file on resize failure
-              const rollbackCommand = `cat > "${configPath}" << 'EOFCONFIG'
-${reconstructConfig(currentConfig ?? {})}
-EOFCONFIG`;
+              const rollbackCommand = buildConfigWriteCommand(configPath, reconstructConfig(currentConfig ?? {}));
 
               try {
                 await new Promise<void>((resolve, reject) => {
@@ -2623,9 +2628,7 @@ EOFCONFIG`;
           } catch (error) {
             console.error('Resize operation threw error:', error);
             // Rollback config file on resize error
-            const rollbackCommand = `cat > "${configPath}" << 'EOFCONFIG'
-${reconstructConfig(currentConfig ?? {})}
-EOFCONFIG`;
+            const rollbackCommand = buildConfigWriteCommand(configPath, reconstructConfig(currentConfig ?? {}));
 
             try {
               await new Promise<void>((resolve, reject) => {
@@ -2855,8 +2858,8 @@ EOFCONFIG`;
   // Execute backup for a container
   executeBackup: publicProcedure
     .input(z.object({
-      containerId: z.string(),
-      storage: z.string(),
+      containerId: vmidSchema,
+      storage: storageIdSchema,
       serverId: z.number()
     }))
     .mutation(async ({ input }) => {
@@ -2973,7 +2976,7 @@ EOFCONFIG`;
   // Get container hostname/name
   getContainerHostname: publicProcedure
     .input(z.object({
-      containerId: z.string(),
+      containerId: vmidSchema,
       serverId: z.number(),
       containerType: z.enum(['lxc', 'vm'])
     }))
@@ -2993,16 +2996,15 @@ EOFCONFIG`;
         const { getSSHExecutionService } = await import('~/server/ssh-execution-service');
         const sshExecutionService = getSSHExecutionService();
 
-        const nodeName = (server as Server).name;
         const configPath = input.containerType === 'lxc'
-          ? `/etc/pve/nodes/${nodeName}/lxc/${input.containerId}.conf`
-          : `/etc/pve/nodes/${nodeName}/qemu-server/${input.containerId}.conf`;
+          ? `/etc/pve/lxc/${input.containerId}.conf`
+          : `/etc/pve/qemu-server/${input.containerId}.conf`;
 
         let configContent = '';
         await new Promise<void>((resolve) => {
           void sshExecutionService.executeCommand(
             server as Server,
-            `cat "${configPath}" 2>/dev/null || echo ""`,
+            `cat ${quoteShellArgument(configPath)} 2>/dev/null || echo ""`,
             (data: string) => {
               configContent += data;
             },
@@ -3300,11 +3302,11 @@ EOFCONFIG`;
   // Note: nextIds will be obtained sequentially during cloning in server.js
   executeClone: publicProcedure
     .input(z.object({
-      containerId: z.string(),
+      containerId: vmidSchema,
       serverId: z.number(),
-      storage: z.string(),
-      cloneCount: z.number().min(1).max(100),
-      hostnames: z.array(z.string()),
+      storage: storageIdSchema,
+      cloneCount: z.number().int().min(1).max(50),
+      hostnames: z.array(hostnameSchema).max(50),
       containerType: z.enum(['lxc', 'vm'])
     }))
     .mutation(async ({ input }) => {
@@ -3368,7 +3370,7 @@ EOFCONFIG`;
   // Add cloned container to database
   addClonedContainerToDatabase: publicProcedure
     .input(z.object({
-      containerId: z.string(),
+      containerId: vmidSchema,
       serverId: z.number(),
       containerType: z.enum(['lxc', 'vm'])
     }))
@@ -3389,16 +3391,15 @@ EOFCONFIG`;
         const sshExecutionService = getSSHExecutionService();
 
         // Read config file to get hostname/name (node-specific path)
-        const nodeName = (server as Server).name;
         const configPath = input.containerType === 'lxc'
-          ? `/etc/pve/nodes/${nodeName}/lxc/${input.containerId}.conf`
-          : `/etc/pve/nodes/${nodeName}/qemu-server/${input.containerId}.conf`;
+          ? `/etc/pve/lxc/${input.containerId}.conf`
+          : `/etc/pve/qemu-server/${input.containerId}.conf`;
 
         let configContent = '';
         await new Promise<void>((resolve) => {
           void sshExecutionService.executeCommand(
             server as Server,
-            `cat "${configPath}" 2>/dev/null || echo ""`,
+            `cat ${quoteShellArgument(configPath)} 2>/dev/null || echo ""`,
             (data: string) => {
               configContent += data;
             },

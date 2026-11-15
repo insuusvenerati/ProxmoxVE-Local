@@ -7,6 +7,10 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import stripAnsi from 'strip-ansi';
+import { databaseIdSchema, storageIdSchema, vmidSchema } from '~/server/lib/proxmoxValidation';
+import { quoteShellArgument } from '~/server/services/backupPath';
+import { runRemoteCommand } from '~/server/services/remoteCommand';
+import type { Server } from '~/types/server';
 
 export const backupsRouter = createTRPCRouter({
   // Get all backups grouped by container ID
@@ -140,9 +144,9 @@ export const backupsRouter = createTRPCRouter({
   // Restore backup
   restoreBackup: publicProcedure
     .input(z.object({
-      backupId: z.number(),
-      containerId: z.string(),
-      serverId: z.number(),
+      backupId: databaseIdSchema,
+      containerId: vmidSchema,
+      serverId: databaseIdSchema,
     }))
     .mutation(async ({ input }) => {
       try {
@@ -157,6 +161,7 @@ export const backupsRouter = createTRPCRouter({
           success: result.success,
           error: result.error,
           progress: result.progress,
+          recoveryPath: result.recoveryPath,
         };
       } catch (error) {
         console.error('Error in restoreBackup:', error);
@@ -171,9 +176,9 @@ export const backupsRouter = createTRPCRouter({
   // Create a new backup via vzdump
   createBackup: publicProcedure
     .input(z.object({
-      serverId: z.number(),
-      containerId: z.string(),
-      storage: z.string(),
+      serverId: databaseIdSchema,
+      containerId: vmidSchema,
+      storage: storageIdSchema,
     }))
     .mutation(async ({ input }) => {
       try {
@@ -184,40 +189,8 @@ export const backupsRouter = createTRPCRouter({
           return { success: false, error: 'Server not found' };
         }
 
-        const { default: SSHService } = await import('~/server/ssh-service');
-        const { getSSHExecutionService } = await import('~/server/ssh-execution-service');
-        const sshService = new SSHService();
-        const sshExecutionService = getSSHExecutionService();
-
-        // Test SSH connection first
-        const connectionTest = await sshService.testSSHConnection(server as any);
-        if (!(connectionTest as any).success) {
-          return {
-            success: false,
-            error: `SSH connection failed: ${(connectionTest as any).error ?? 'Unknown error'}`,
-          };
-        }
-
-        // vzdump with snapshot mode (non-disruptive) and zstd compression
-        const command = `vzdump ${input.containerId} --storage ${input.storage} --compress zstd --mode snapshot 2>&1`;
-        let output = '';
-
-        await new Promise<void>((resolve, reject) => {
-          sshExecutionService.executeCommand(
-            server as any,
-            command,
-            (data: string) => { output += data; },
-            (error: string) => { reject(new Error(error || 'vzdump failed')); },
-            (exitCode: number) => {
-              if (exitCode !== 0) {
-                reject(new Error(`vzdump failed (exit ${exitCode}): ${output.trim()}`));
-              } else {
-                resolve();
-              }
-            }
-          );
-        });
-
+        const command = `test ! -d /run/lock/pve-local-restore-${input.containerId} && vzdump ${input.containerId} --storage ${quoteShellArgument(input.storage)} --compress zstd --mode snapshot 2>&1`;
+        await runRemoteCommand(server as unknown as Server, command, 'Create container backup');
         // Trigger background re-discovery so the new backup appears immediately
         const backupService = getBackupService();
         void backupService.discoverAllBackups().catch(() => {/* non-critical */});
